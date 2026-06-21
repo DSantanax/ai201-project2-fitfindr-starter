@@ -18,8 +18,19 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
-from tools import search_listings, suggest_outfit, create_fit_card
+import json
+import os
 
+from dotenv import load_dotenv
+
+from tools import search_listings, suggest_outfit, create_fit_card, _get_groq_client
+
+load_dotenv()
+
+MAX_LOOPS = os.environ.get("MAX_LOOPS")
+
+if not MAX_LOOPS:
+    raise ValueError("MAX_LOOPS not set. Add it to a .env file in the project root.")
 
 # ── session state ─────────────────────────────────────────────────────────────
 
@@ -46,6 +57,35 @@ def _new_session(query: str, wardrobe: dict) -> dict:
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
+
+def _build_state_prompt(session: dict) -> str:
+    """Build the LLM prompt that describes available tools and current session state."""
+    parsed = session.get("parsed", {})
+    selected = session.get("selected_item")
+    search_count = len(session.get("search_results", []))
+    return (
+        "You are an AI fashion assistant agent. Decide which tool to call next.\n\n"
+        "Available tools:\n"
+        "- search_listings: Find clothing items matching the query. Call this first.\n"
+        "- suggest_outfit: Suggest outfits for the selected item. Call after search_listings returns results.\n"
+        "- create_fit_card: Generate an OOTD caption. Call after suggest_outfit returns a suggestion.\n"
+        "- done: Stop the loop. Call when fit_card is complete or an error has occurred.\n\n"
+        "Current state:\n"
+        f"- Query: \"{session['query']}\"\n"
+        f"- Parsed: description=\"{parsed.get('description', '')}\", "
+        f"size={parsed.get('size')}, max_price={parsed.get('max_price')}\n"
+        f"- Search results: {search_count} items found, "
+        f"selected: \"{selected['title'] if selected else 'none'}\"\n"
+        f"- Outfit suggestion: {'available' if session.get('outfit_suggestion') else 'none'}\n"
+        f"- Fit card: {'available' if session.get('fit_card') else 'none'}\n"
+        f"- Error: {session.get('error') or 'none'}\n\n"
+        "Return ONLY a JSON object:\n"
+        "{\"reasoning\": \"...\", "
+        "\"action\": \"search_listings\"|\"suggest_outfit\"|\"create_fit_card\"|\"done\", "
+        "\"params\": {\"description\": \"...\", \"size\": null, \"max_price\": null}}\n"
+        "params is only used for search_listings — set to {} for all other actions."
+    )
+
 
 def run_agent(query: str, wardrobe: dict) -> dict:
     """
@@ -92,9 +132,93 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Initialize session
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+    client = _get_groq_client()
+
+    # Parse query before the loop (per Mermaid: LLM Parse Query → Planning Loop)
+    parse_prompt = (
+        "Extract the search parameters from this clothing query. "
+        "Return ONLY a JSON object with exactly these three fields:\n"
+        "- \"description\": the item description (string)\n"
+        "- \"size\": alpha clothing size like S, M, L, XL, or null if not mentioned\n"
+        "- \"max_price\": maximum price as a number, or null if not mentioned\n\n"
+        f"Query: {query}\n\n"
+        "Return only the JSON object, nothing else."
+    )
+    raw_parse = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": parse_prompt}],
+        temperature=0,
+    ).choices[0].message.content.strip()
+
+    try:
+        session["parsed"] = json.loads(raw_parse)
+    except (json.JSONDecodeError, ValueError):
+        session["parsed"] = {"description": query, "size": None, "max_price": None}
+
+    # Planning loop — LLM reasons about which tool to call each iteration
+    for _ in range(int(MAX_LOOPS)):
+        raw_decision = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": _build_state_prompt(session)}],
+            temperature=0,
+        ).choices[0].message.content.strip()
+
+        try:
+            decision = json.loads(raw_decision)
+        except (json.JSONDecodeError, ValueError):
+            break
+
+        action = decision.get("action", "done")
+
+        if action == "done":
+            break
+
+        elif action == "search_listings":
+            params = decision.get("params") or {}
+            parsed = session["parsed"]
+            description = params.get("description") or parsed.get("description") or query
+            size = params.get("size") or parsed.get("size")
+            max_price = params.get("max_price") or parsed.get("max_price")
+            if max_price is not None:
+                try:
+                    max_price = float(max_price)
+                except (TypeError, ValueError):
+                    max_price = None
+
+            results = search_listings(description=description, size=size, max_price=max_price)
+            session["search_results"] = results
+            if not results:
+                session["error"] = (
+                    "No listings matched your query. Try broadening your search — "
+                    "use fewer filters or a more general description."
+                )
+                break
+            session["selected_item"] = results[0]
+
+        elif action == "suggest_outfit":
+            if not session.get("selected_item"):
+                session["error"] = "Cannot suggest outfit: no item selected yet."
+                break
+            session["outfit_suggestion"] = suggest_outfit(
+                new_item=session["selected_item"],
+                wardrobe=wardrobe,
+            )
+
+        elif action == "create_fit_card":
+            if not session.get("outfit_suggestion"):
+                session["error"] = "Cannot create fit card: no outfit suggestion yet."
+                break
+            session["fit_card"] = create_fit_card(
+                outfit=session["outfit_suggestion"],
+                new_item=session["selected_item"],
+            )
+
+        # All outputs filled — exit early
+        if session["fit_card"]:
+            break
+
     return session
 
 
