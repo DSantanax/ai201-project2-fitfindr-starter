@@ -16,7 +16,7 @@ You must have at least 3 tools. The three required tools are listed — add any 
 
 **What it does:**
 
-The agent will be given parsed information such as the string description of the user query, a letter string of commoon sizes of the item in question, and the max price in decimal if given. This function will query a list of dicts of clothing items from the wardrobe list and filter based on the size/price and return the top 3 matching items sorted by relevance from the top matching listings found in the database based on the description.
+The agent will be given parsed information such as the string description of the user query, a letter string of common sizes of the item in question, and the max price in decimal if given. This function will query a list of dicts of clothing items from the wardrobe list and filter based on the size/price and return the top 3 matching items sorted by relevance from the top matching listings found in the database based on the description.
 
 **Input parameters:**
 <!-- List each parameter, its type, and what it represents -->

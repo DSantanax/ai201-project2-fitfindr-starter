@@ -58,32 +58,74 @@ def _new_session(query: str, wardrobe: dict) -> dict:
 
 # ── planning loop ─────────────────────────────────────────────────────────────
 
-def _build_state_prompt(session: dict) -> str:
-    """Build the LLM prompt that describes available tools and current session state."""
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_listings",
+            "description": (
+                "Search the thrift listings database for clothing items matching "
+                "the user's query. Use this to find items before suggesting outfits."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Keywords describing the clothing item the user wants.",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "Clothing size filter (e.g. 'M', 'W30', 'US 8'). Omit if not specified.",
+                    },
+                    "max_price": {
+                        "type": "number",
+                        "description": "Maximum price in dollars. Omit if not specified.",
+                    },
+                },
+                "required": ["description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "suggest_outfit",
+            "description": (
+                "Suggest outfit combinations for the selected thrifted item using "
+                "the user's wardrobe. Use this after a listing has been found and selected."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_fit_card",
+            "description": (
+                "Generate a shareable OOTD caption for the thrifted item and outfit. "
+                "Use this after an outfit suggestion is available."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
+
+
+def _build_state_message(session: dict) -> str:
+    """Return a context message describing the current session state for the LLM."""
     parsed = session.get("parsed", {})
     selected = session.get("selected_item")
     search_count = len(session.get("search_results", []))
+    selected_label = f"\"{selected['title']}\"" if selected else "none"
     return (
-        "You are an AI fashion assistant agent. Decide which tool to call next.\n\n"
-        "Available tools:\n"
-        "- search_listings: Find clothing items matching the query. Call this first.\n"
-        "- suggest_outfit: Suggest outfits for the selected item. Call after search_listings returns results.\n"
-        "- create_fit_card: Generate an OOTD caption. Call after suggest_outfit returns a suggestion.\n"
-        "- done: Stop the loop. Call when fit_card is complete or an error has occurred.\n\n"
-        "Current state:\n"
-        f"- Query: \"{session['query']}\"\n"
+        f"User query: \"{session['query']}\"\n\n"
+        "Session progress:\n"
         f"- Parsed: description=\"{parsed.get('description', '')}\", "
         f"size={parsed.get('size')}, max_price={parsed.get('max_price')}\n"
-        f"- Search results: {search_count} items found, "
-        f"selected: \"{selected['title'] if selected else 'none'}\"\n"
-        f"- Outfit suggestion: {'available' if session.get('outfit_suggestion') else 'none'}\n"
-        f"- Fit card: {'available' if session.get('fit_card') else 'none'}\n"
-        f"- Error: {session.get('error') or 'none'}\n\n"
-        "Return ONLY a JSON object:\n"
-        "{\"reasoning\": \"...\", "
-        "\"action\": \"search_listings\"|\"suggest_outfit\"|\"create_fit_card\"|\"done\", "
-        "\"params\": {\"description\": \"...\", \"size\": null, \"max_price\": null}}\n"
-        "params is only used for search_listings — set to {} for all other actions."
+        f"- Search results: {search_count} item(s) found, selected: {selected_label}\n"
+        f"- Outfit suggestion: {'done' if session.get('outfit_suggestion') else 'not yet'}\n"
+        f"- Fit card: {'done' if session.get('fit_card') else 'not yet'}\n"
     )
 
 
@@ -157,26 +199,36 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     except (json.JSONDecodeError, ValueError):
         session["parsed"] = {"description": query, "size": None, "max_price": None}
 
-    # Planning loop — LLM reasons about which tool to call each iteration
+    # Planning loop — LLM picks a tool each iteration via native tool calling
+    messages = [
+        {"role": "system", "content": "You are a fashion assistant helping a user find and style thrifted clothing. Use the available tools in sequence to find a listing, suggest an outfit, and create a fit card."},
+        {"role": "user", "content": _build_state_message(session)},
+    ]
+
     for _ in range(int(MAX_LOOPS)):
-        raw_decision = client.chat.completions.create(
+        response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": _build_state_prompt(session)}],
+            messages=messages,
+            tools=_TOOLS,
+            tool_choice="auto",
             temperature=0,
-        ).choices[0].message.content.strip()
+        )
 
+        message = response.choices[0].message
+        if not message.tool_calls:
+            break
+
+        # Append assistant turn so the LLM sees its own tool call next iteration
+        messages.append(message)
+
+        tool_call = message.tool_calls[0]
+        name = tool_call.function.name
         try:
-            decision = json.loads(raw_decision)
+            params = json.loads(tool_call.function.arguments)
         except (json.JSONDecodeError, ValueError):
-            break
+            params = {}
 
-        action = decision.get("action", "done")
-
-        if action == "done":
-            break
-
-        elif action == "search_listings":
-            params = decision.get("params") or {}
+        if name == "search_listings":
             parsed = session["parsed"]
             description = params.get("description") or parsed.get("description") or query
             size = params.get("size") or parsed.get("size")
@@ -186,7 +238,6 @@ def run_agent(query: str, wardrobe: dict) -> dict:
                     max_price = float(max_price)
                 except (TypeError, ValueError):
                     max_price = None
-
             results = search_listings(description=description, size=size, max_price=max_price)
             session["search_results"] = results
             if not results:
@@ -194,10 +245,12 @@ def run_agent(query: str, wardrobe: dict) -> dict:
                     "No listings matched your query. Try broadening your search — "
                     "use fewer filters or a more general description."
                 )
-                break
-            session["selected_item"] = results[0]
+                tool_result = "No listings found."
+            else:
+                session["selected_item"] = results[0]
+                tool_result = f"Found {len(results)} listing(s). Selected: \"{results[0]['title']}\" at ${results[0]['price']}."
 
-        elif action == "suggest_outfit":
+        elif name == "suggest_outfit":
             if not session.get("selected_item"):
                 session["error"] = "Cannot suggest outfit: no item selected yet."
                 break
@@ -205,8 +258,9 @@ def run_agent(query: str, wardrobe: dict) -> dict:
                 new_item=session["selected_item"],
                 wardrobe=wardrobe,
             )
+            tool_result = session["outfit_suggestion"]
 
-        elif action == "create_fit_card":
+        elif name == "create_fit_card":
             if not session.get("outfit_suggestion"):
                 session["error"] = "Cannot create fit card: no outfit suggestion yet."
                 break
@@ -214,9 +268,19 @@ def run_agent(query: str, wardrobe: dict) -> dict:
                 outfit=session["outfit_suggestion"],
                 new_item=session["selected_item"],
             )
+            tool_result = session["fit_card"]
 
-        # All outputs filled — exit early
-        if session["fit_card"]:
+        else:
+            tool_result = "Unknown tool."
+
+        # Append tool result so the LLM knows what the tool returned
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": tool_result,
+        })
+
+        if session.get("error") or session["fit_card"]:
             break
 
     return session
